@@ -1,10 +1,11 @@
 from fastapi import FastAPI, Request, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from groq import Groq
 from datetime import datetime, timedelta
 import hashlib
 import hmac
+import logging
 import os
 import json
 import sqlite3
@@ -13,6 +14,8 @@ from typing import Optional
 from dotenv import load_dotenv
 
 load_dotenv()
+
+logger = logging.getLogger(__name__)
 
 DB_PATH = os.getenv("SQLITE_PATH", os.path.join(os.path.dirname(__file__), "subscriptions.db"))
 
@@ -40,6 +43,30 @@ class MatchRequest(BaseModel):
     resume: str
     job_description: str
     email: Optional[str] = None
+
+
+class CategoryScore(BaseModel):
+    category: str
+    score: int
+    explanation: str
+
+
+class AnalysisResponse(BaseModel):
+    overall_match_score: int = 0
+    score_explanation: str = ""
+    category_scores: list[CategoryScore] = Field(default_factory=list)
+    matching_skills: list[str] = Field(default_factory=list)
+    missing_skills: list[str] = Field(default_factory=list)
+    critical_missing_requirements: list[str] = Field(default_factory=list)
+    quick_tips: list[str] = Field(default_factory=list)
+    cv_improvement_suggestions: list[str] = Field(default_factory=list)
+    warning: str = ""
+    score: int = 0
+    missing_keywords: list[str] = Field(default_factory=list)
+    tips: list[str] = Field(default_factory=list)
+    remaining_today: Optional[int] = None
+    is_premium: bool = False
+    subscription_status: str = "free"
 
 
 class SubscriptionRequest(BaseModel):
@@ -205,7 +232,11 @@ def sync_premium_user(
 def get_subscription_status(email: Optional[str]) -> SubscriptionStatusResponse:
     normalized_email = normalize_email(email)
     if not normalized_email:
-        raise HTTPException(status_code=400, detail="Email is required.")
+        return SubscriptionStatusResponse(
+            email="",
+            is_premium=False,
+            subscription_status="free",
+        )
 
     db_record = get_subscription_record_by_email(normalized_email)
     if db_record:
@@ -223,13 +254,17 @@ def verify_lemonsqueezy_signature(payload: bytes, signature: Optional[str]) -> b
     if not webhook_secret or not signature:
         return False
 
+    normalized_signature = signature.strip()
+    if normalized_signature.startswith("sha256="):
+        normalized_signature = normalized_signature.removeprefix("sha256=").strip()
+
     digest = hmac.new(
         webhook_secret.encode("utf-8"),
         payload,
         hashlib.sha256,
     ).hexdigest()
 
-    return hmac.compare_digest(digest, signature)
+    return hmac.compare_digest(digest, normalized_signature)
 
 
 def extract_lemonsqueezy_email(event: dict) -> Optional[str]:
@@ -256,16 +291,37 @@ def get_groq_client() -> Groq:
 
 
 PROMPT_TEMPLATE = """
-You are an ATS (Applicant Tracking System) resume analyzer.
+You are a precise ATS resume analyzer.
 
-Compare the RESUME below against the JOB DESCRIPTION.
+Compare the RESUME against the JOB DESCRIPTION and return ONLY valid JSON.
 
-Return ONLY valid JSON in this exact format, no other text:
+Rules:
+- Do not invent skills, experience, education, certifications, or tools.
+- Only include category scores when the category can be evaluated reliably from the provided text.
+- If evidence is weak or missing, omit that category or use an empty array.
+- Keep explanations brief, concrete, and grounded in the text.
+- The warning must explain that missing keywords do not always mean the candidate lacks the skill.
+
+Return JSON in this exact structure:
 {{
-  "score": <number 0-100>,
-  "missing_keywords": ["keyword1", "keyword2", "keyword3"],
-  "tips": ["tip1", "tip2", "tip3"]
+  "overall_match_score": <number 0-100>,
+  "score_explanation": "short explanation of the score",
+  "category_scores": [
+    {{"category": "Skills match", "score": 0, "explanation": "..."}},
+    {{"category": "Experience match", "score": 0, "explanation": "..."}},
+    {{"category": "Keywords match", "score": 0, "explanation": "..."}},
+    {{"category": "Education/qualification match", "score": 0, "explanation": "..."}},
+    {{"category": "Tools/technologies match", "score": 0, "explanation": "..."}}
+  ],
+  "matching_skills": ["skill 1", "skill 2"],
+  "missing_skills": ["skill 1", "skill 2"],
+  "critical_missing_requirements": ["requirement 1", "requirement 2"],
+  "quick_tips": ["tip 1", "tip 2", "tip 3"],
+  "cv_improvement_suggestions": ["suggestion 1", "suggestion 2"],
+  "warning": "short warning about keyword limitations"
 }}
+
+Only include categories in category_scores when you can support the score from the provided data. If a category cannot be evaluated reliably, leave it out.
 
 RESUME:
 {resume}
@@ -273,6 +329,87 @@ RESUME:
 JOB DESCRIPTION:
 {job_description}
 """
+
+
+def clamp_score(value) -> int:
+    try:
+        return max(0, min(100, int(value)))
+    except (TypeError, ValueError):
+        return 0
+
+
+def normalize_text_list(value, *, limit: Optional[int] = None) -> list[str]:
+    if not isinstance(value, list):
+        return []
+
+    normalized: list[str] = []
+    for item in value:
+        text = str(item).strip()
+        if text:
+            normalized.append(text)
+        if limit is not None and len(normalized) >= limit:
+            break
+    return normalized
+
+
+def normalize_category_scores(value) -> list[dict[str, object]]:
+    if not isinstance(value, list):
+        return []
+
+    normalized: list[dict[str, object]] = []
+    for item in value:
+        if not isinstance(item, dict):
+            continue
+
+        category = str(item.get("category") or item.get("name") or item.get("title") or "").strip()
+        explanation = str(item.get("explanation") or item.get("reason") or "").strip()
+        if not category or not explanation:
+            continue
+
+        normalized.append(
+            {
+                "category": category,
+                "score": clamp_score(item.get("score", 0)),
+                "explanation": explanation,
+            }
+        )
+
+    return normalized
+
+
+def normalize_analysis_result(result: dict) -> dict:
+    overall_score = clamp_score(result.get("overall_match_score", result.get("score", 0)))
+    matching_skills = normalize_text_list(result.get("matching_skills"), limit=10)
+    missing_skills = normalize_text_list(result.get("missing_skills"), limit=10)
+    critical_missing_requirements = normalize_text_list(
+        result.get("critical_missing_requirements"),
+        limit=5,
+    )
+    quick_tips = normalize_text_list(result.get("quick_tips"), limit=5)
+    cv_improvement_suggestions = normalize_text_list(
+        result.get("cv_improvement_suggestions"),
+        limit=5,
+    )
+
+    normalized_result = {
+        "overall_match_score": overall_score,
+        "score_explanation": str(result.get("score_explanation") or "").strip(),
+        "category_scores": normalize_category_scores(result.get("category_scores")),
+        "matching_skills": matching_skills,
+        "missing_skills": missing_skills,
+        "critical_missing_requirements": critical_missing_requirements,
+        "quick_tips": quick_tips,
+        "cv_improvement_suggestions": cv_improvement_suggestions,
+        "warning": str(result.get("warning") or "").strip(),
+        "score": overall_score,
+        "missing_keywords": normalize_text_list(
+            result.get("missing_keywords") or missing_skills,
+            limit=10,
+        ),
+        "tips": quick_tips,
+    }
+
+    return normalized_result
 
 
 @app.post("/analyze")
@@ -320,14 +457,18 @@ def analyze(data: MatchRequest, request: Request):
             detail=f"AI analysis failed: {exc.__class__.__name__}"
         ) from exc
 
-    result["score"] = max(0, min(100, int(result.get("score", 0))))
-    result["missing_keywords"] = [str(item) for item in result.get("missing_keywords", [])][:10]
-    result["tips"] = [str(item) for item in result.get("tips", [])][:5]
+    if not isinstance(result, dict):
+        raise HTTPException(
+            status_code=502,
+            detail="AI analysis returned an invalid JSON structure."
+        )
+
+    result = normalize_analysis_result(result)
     result["remaining_today"] = None if is_premium else FREE_DAILY_LIMIT - usage_tracker[client_ip]["count"]
     result["is_premium"] = is_premium
     result["subscription_status"] = subscription_status.subscription_status
 
-    return MatchResponse(**result)
+    return AnalysisResponse(**result)
 
 
 @app.get("/subscription/status")
@@ -342,6 +483,12 @@ async def lemonsqueezy_webhook(request: Request):
     event_name = request.headers.get("x-event-name")
 
     if not verify_lemonsqueezy_signature(payload, signature):
+        logger.warning(
+            "Rejected Lemon Squeezy webhook: missing_or_invalid_signature event=%s has_signature=%s has_secret=%s",
+            event_name,
+            bool(signature),
+            bool(os.getenv("LEMONSQUEEZY_WEBHOOK_SECRET")),
+        )
         raise HTTPException(status_code=400, detail="Invalid Lemon Squeezy webhook signature.")
 
     try:
