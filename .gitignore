@@ -3,6 +3,7 @@ backend/venv/
 backend/__pycache__/
 backend/*.pyc
 backend/.env
+backend/subscriptions.db
 
 # Node / React
 frontend/node_modules/
