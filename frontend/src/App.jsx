@@ -1,5 +1,6 @@
 import { useEffect, useMemo, useState } from 'react'
 import './App.css'
+import { Analytics } from '@vercel/analytics/react'
 
 const API_BASE_URL = import.meta.env.VITE_API_BASE_URL || 'http://127.0.0.1:8000'
 const LEMON_SQUEEZY_CHECKOUT_URL = import.meta.env.VITE_LEMONSQUEEZY_CHECKOUT_URL || ''
@@ -961,6 +962,8 @@ function App() {
           </div>
         </div>
       )}
+            <Analytics />
+
     </div>
   )
 }
